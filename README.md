@@ -1,20 +1,81 @@
-# Sentinel-Expanse
+<div align="center">
 
-A custom dictionary-based streaming compression engine, built from scratch in Python and C.
+# Ω SENTINEL-EXPANSE
 
-Inspired by the Pied Piper compression arc from Silicon Valley — specifically the question: *what actually makes a compression algorithm good?*
+### Multi-Dictionary Streaming Compression Engine
 
----
-
-## What It Does
-
-Standard zlib compression uses a single 32KB dictionary trained on the first bytes of a file. Sentinel-Expanse takes a different approach: it splits the input into N segments, trains a separate dictionary per segment using token frequency analysis, then at compression time probes each chunk against all dictionaries and picks the best one.
-
-For structured, repetitive data like logs — which is what the VERITAS provenance layer produces — this measurably improves compression ratio without significant speed loss.
+*Part of the VERITAS Sovereign Infrastructure Stack*
 
 ---
 
-## The Weisman Score
+![Python](https://img.shields.io/badge/Python-3.10+-gold?style=flat-square&logo=python&logoColor=black)
+![C](https://img.shields.io/badge/C-Native_Engine-gold?style=flat-square&logo=c&logoColor=black)
+![License](https://img.shields.io/badge/License-MIT-gold?style=flat-square)
+![Status](https://img.shields.io/badge/Status-Research_Grade-gold?style=flat-square)
+![Author](https://img.shields.io/badge/Author-VRTXOmega-gold?style=flat-square)
+
+</div>
+
+---
+
+## ◈ What It Is
+
+Sentinel-Expanse is a custom dictionary-based streaming compression engine built from scratch in Python and C. It is **not** a wrapper around an existing algorithm — it is a complete compression pipeline with its own binary container format, dictionary training system, multi-dictionary chunk routing, and a custom performance metric.
+
+Inspired by the Pied Piper compression arc from Silicon Valley, this project started as a research exercise asking: *what actually makes a compression algorithm good?*
+
+The answer informed the design of the [Omega Brain MCP](https://github.com/VrtxOmega/omega-brain-mcp) provenance layer.
+
+---
+
+## ◈ The Core Insight
+
+Standard zlib uses a single 32KB sliding window as its compression dictionary — trained on the first bytes of a file regardless of what's in the rest of it.
+
+Sentinel-Expanse trains **multiple dictionaries** from different regions of the target data, then selects the best dictionary per chunk at compression time. For structured, repetitive data like AI-generated logs and provenance records, this produces measurably better results without sacrificing throughput.
+
+---
+
+## ◈ Architecture
+
+```
+Input File
+    │
+    ├─► DictionaryTrainer
+    │       ├── Split file into N equal segments
+    │       ├── Read 1MB training sample per segment
+    │       ├── Token frequency scoring: length × count
+    │       └── Pack top tokens into N × 32KB dictionaries
+    │
+    └─► SentinelV6 Compressor
+            ├── Read chunk (4MB)
+            ├── Probe 16KB against all N dicts at level 1
+            ├── Select best dictionary (lowest probe size)
+            ├── Compress full chunk at level 6 with winner
+            ├── Write: [dict_id | ulen | clen | adler32 | data]
+            └── Repeat until EOF
+                        │
+                        ▼
+              SNTL Binary Container
+              (seekable, integrity-verified)
+```
+
+---
+
+## ◈ Engines
+
+| Engine | Language | Dictionaries | Selection |
+|--------|----------|-------------|-----------|
+| `GodTierEngine` v5.1 | Python | 1 (first 32KB) | Static |
+| `SentinelV6` | Python | Up to 4 | Level-1 probe |
+| `sentinel_v6.c` | C | Up to 16 | Rolling hash fingerprint |
+| `sentinel_v7.c` | C | Up to 16 | Hardened build |
+
+The C implementation replaces the Python probe with a rolling hash fingerprint — a Bloom-filter-style lookup that selects dictionaries without running a compression pass. This eliminates the probe overhead entirely.
+
+---
+
+## ◈ The Weisman Score
 
 Named after the fictional Pied Piper engineer.
 
@@ -22,102 +83,120 @@ Named after the fictional Pied Piper engineer.
 Weisman Score = Compression Ratio × Throughput (MB/s)
 ```
 
-Most benchmarks optimize for ratio or speed independently. The Weisman Score treats them as a tradeoff — a 10× compressor at 1 MB/s scores the same as a 2× compressor at 5 MB/s. In practice, throughput usually matters more than an extra half-point of ratio.
+Standard benchmarks optimize for ratio or speed in isolation. The Weisman Score treats them as a tradeoff — because in practice, a 3.8× compressor at 120 MB/s outperforms a 5× compressor at 8 MB/s for real workloads.
 
-The benchmark harness runs 5 repetitions per engine and reports mean ± standard deviation.
-
----
-
-## Engines
-
-**v5 — GodTierEngine (Python)**
-Dictionary compression using the first 32KB of input as the training dictionary. Baseline implementation. Level 4 compression offers the optimal Weisman Score for structured log data.
-
-**v6 — SentinelV6 (Python)**
-Multi-dictionary engine. Trains N dictionaries from N equal segments of the input. Probes first 16KB of each chunk at level 1 to select the best dictionary, then compresses the full chunk at level 6.
-
-**v6/v7 Native (C)**
-Production engine. Replaces the Python probe heuristic with rolling hash fingerprinting — a Bloom-filter-style lookup that selects the best dictionary without running a full compression probe. Supports up to 16 dictionary slots. Compiles with gcc or MSVC.
+The benchmark harness runs **5 repetitions per engine** and reports mean ± standard deviation.
 
 ---
 
-## File Format
+## ◈ File Format
 
-Both versions use the `SNTL` magic header with versioned binary format. Every dictionary and every chunk carries an Adler-32 checksum. The format is seekable — any chunk can be decompressed independently without reading from the beginning.
+### v5 Header
+```
+[SNTL][version:4][dict_len:4][adler32:4][dictionary:32KB][payload...]
+```
 
-See `TECHNICAL_MANUAL.md` for the full format specification.
+### v6 Header
+```
+[SNTL][version:4][flags:4][dict_count:2][reserved:2]
+[N × (dict_len:4 + adler32:4 + dict_data:32KB)]
+[chunk stream...]
+```
+
+### Chunk Format (v6)
+```
+[dict_id:1][uncompressed_len:4][compressed_len:4][adler32:4][data...]
+```
+
+Every chunk is **independently decompressible**. The format is seekable — any chunk can be restored without reading from the beginning.
 
 ---
 
-## Quick Start
+## ◈ Quick Start
 
-### Python
 ```bash
-# Compress
+# Python — compress with 4 dictionaries
 python sentinel_expanse.py compress input.log output.god --mode v6 --dicts 4
 
-# Decompress (auto-detects v5 or v6)
+# Python — decompress (auto-detects v5 or v6)
 python sentinel_expanse.py decompress output.god restored.log
 
-# Verify integrity
+# Python — verify integrity
 python sentinel_expanse.py verify output.god
 
-# Benchmark (Weisman evaluation, 5 reps)
+# Python — run Weisman benchmark
 python sentinel_expanse.py benchmark input.log
 
-# GOD TIER mode — benchmark + compress + verify round-trip
+# GOD TIER — benchmark + compress + verify round-trip
 python sentinel_expanse.py god input.log
 ```
 
-### C
 ```bash
+# C — compile
 gcc -O3 c/sentinel_v6.c -o sentinel_v6 -lz
-./sentinel_v6 compress input.log output.god 4
-./sentinel_v6 decompress output.god restored.log
-```
 
-### Run the benchmark harness
-```bash
-python benchmark_harness.py
-# Generates 10MB of synthetic structured logs
-# Runs Weisman evaluation across ZLIB, LZMA, and Sentinel v5
-# Verifies bit-perfect round-trip with SHA-256
+# C — compress with 4 dicts
+./sentinel_v6 compress input.log output.god 4
+
+# C — decompress
+./sentinel_v6 decompress output.god restored.log
 ```
 
 ---
 
-## Project Structure
+## ◈ Benchmark Harness
+
+```bash
+python benchmark_harness.py
+```
+
+Generates 10MB of synthetic structured logs (auth events, DB timeouts, kernel syscalls) and runs a full Weisman evaluation comparing ZLIB, LZMA, and Sentinel v5 with SHA-256 bit-perfect verification.
+
+---
+
+## ◈ Repository Structure
 
 ```
 sentinel-expanse/
 ├── README.md
-├── TECHNICAL_MANUAL.md       — full architecture and format spec
+├── TECHNICAL_MANUAL.md          — full architecture + format spec
 ├── python/
-│   ├── sentinel_expanse.py   — Python research engine (v5 + v6)
-│   └── benchmark_harness.py  — benchmark suite with synthetic data generator
+│   ├── sentinel_expanse.py      — research engine (v5 + v6)
+│   └── benchmark_harness.py     — Weisman evaluation suite
 ├── c/
-│   ├── sentinel_v6.c         — C engine with rolling hash fingerprinting
-│   ├── sentinel_v7.c         — updated C engine
+│   ├── sentinel_v6.c            — native engine, rolling hash fingerprint
+│   ├── sentinel_v7.c            — hardened build
 │   └── Makefile
 └── tests/
-    └── test_roundtrip.py     — bit-perfect verification
+    └── test_roundtrip.py        — bit-perfect verification
 ```
 
 ---
 
-## Background
+## ◈ Connection to the VERITAS Stack
 
-This project started as a research exercise and ended up informing the design of the Omega Brain provenance layer in the VERITAS ecosystem. The provenance layer originally used zlib compression on SQLite BLOB columns — the same pattern as Sentinel v5. At scale (200K+ files) this hit a WASM OOM boundary. Understanding exactly what the compression was and wasn't buying at that scale — knowledge built directly from this project — informed the decision to remove it in favor of FTS5 retrieval.
+The provenance layer in [Omega Brain MCP](https://github.com/VrtxOmega/omega-brain-mcp) originally used zlib compression on SQLite BLOB columns before insertion — the same pattern as Sentinel v5's `GodTierEngine`. At scale (200K+ file corpus) this saturated the WASM Array Buffer and caused fatal OOM failures.
+
+Understanding exactly what the compression was and wasn't buying at that scale — built directly from this research — informed the decision to remove it in favor of FTS5 retrieval. The result: corpus scan time dropped from >60s (OOM fail) to ~7.5s stable.
 
 The research wasn't wasted. It produced the understanding that changed the architecture.
 
 ---
 
-## Author
+## ◈ VERITAS Ecosystem
 
-RJ Lopez / VRTXOmega  
-[github.com/VRTXOmega](https://github.com/VRTXOmega)
+| Project | Description |
+|---------|-------------|
+| [omega-brain-mcp](https://github.com/VrtxOmega/omega-brain-mcp) | Provenance RAG + 10-gate VERITAS pipeline |
+| [ollama-mcp](https://github.com/VrtxOmega/ollama-omega) | Sovereign Ollama bridge for MCP-compatible IDEs |
+| [veritas-portfolio](https://vrtxomega.github.io/veritas-portfolio) | Live portfolio |
 
 ---
 
-*Copyright 2026 RJ Lopez. MIT License.*
+<div align="center">
+
+*Built sovereign. Verified trustless.*
+
+**[VRTXOmega](https://github.com/VrtxOmega)** · Illinois · 2026
+
+</div>
